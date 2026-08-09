@@ -9,3 +9,6 @@ htmlcov/
 data/
 dist/
 
+.DS_Store
+.AppleDouble
+.LSOverride
