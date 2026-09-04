@@ -36,7 +36,7 @@ curl http://localhost/health/ready
 |---|---|---|
 | 系统 | `GET /health/live`, `/health/ready` | 容器与依赖探针 |
 | 用户 | `POST /api/v1/auth/register`, `/login` | JWT 登录 |
-| 日历 | `GET/POST /api/v1/events` | 日程、课表、DDL 统一事件 |
+| 日历 | `GET/POST/PUT/DELETE /api/v1/events`, `GET /api/v1/calendar` | 事件 CRUD、时间筛选；统一返回导入事件、个人日程和任务 DDL |
 | 任务 | `GET/POST /api/v1/tasks` | 作业/待办，支持截止时间 |
 | 番茄钟 | `POST /api/v1/focus/start`, `/{id}/finish` | 服务端记录会话，客户端负责倒计时显示 |
 | 媒体 | `GET /api/v1/media/tracks` | 白噪音/学习音乐元数据 |
@@ -62,6 +62,10 @@ make dev
 - 音乐版权与真实文件上传策略需要项目方确认；仓库只提供元数据/对象存储边界。
 - 校园爬虫必须按具体学校系统实现，mock 只证明接口和隔离边界。
 - 通知、重复日程、CalDAV/ICS、积分商城与桌宠协议属于后续迭代。
+
+日历导入可使用 `POST /api/v1/events/sync`（或 `/api/v1/calendar/sync`），请求体为
+`{"source": "campus", "items": [{"external_id": "...", "title": "...", "kind": "course", "starts_at": "...", "ends_at": "..."}]}`。
+同步按用户、来源和外部 ID 幂等更新；`kind: "task"` 会归一化为 `deadline`，也支持只提供 `due_at`。
 
 ## 许可
 

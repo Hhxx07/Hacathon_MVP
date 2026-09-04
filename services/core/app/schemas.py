@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 
@@ -31,6 +31,10 @@ class EventCreate(BaseModel):
     starts_at: datetime
     ends_at: datetime
     kind: EventKind = EventKind.EVENT
+    # source/external_id are used by campus connectors for idempotent upserts.
+    # They remain optional so manually-created events keep the original API.
+    source: str = Field(default="manual", min_length=1, max_length=50)
+    external_id: str | None = Field(default=None, max_length=255)
 
     @model_validator(mode="after")
     def validate_range(self):
@@ -41,7 +45,74 @@ class EventCreate(BaseModel):
 
 class EventOut(EventCreate, ORMModel):
     id: uuid.UUID
+
+
+class EventUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    description: str | None = None
+    starts_at: datetime | None = None
+    ends_at: datetime | None = None
+    kind: EventKind | None = None
+    source: str | None = Field(default=None, min_length=1, max_length=50)
+    external_id: str | None = Field(default=None, max_length=255)
+
+    @model_validator(mode="after")
+    def validate_range(self):
+        if self.starts_at is not None and self.ends_at is not None and self.ends_at <= self.starts_at:
+            raise ValueError("ends_at must be after starts_at")
+        return self
+
+
+class EventSyncItem(BaseModel):
+    """An item produced by a campus connector.
+
+    Campus connectors use ``task`` for deadlines, while the core calendar
+    stores the normalized ``deadline`` enum value.
+    """
+
+    external_id: str = Field(min_length=1, max_length=255)
+    title: str = Field(min_length=1, max_length=200)
+    description: str | None = None
+    kind: EventKind | str = EventKind.EVENT
+    starts_at: datetime | None = None
+    ends_at: datetime | None = None
+    due_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def normalize_and_validate(self):
+        if isinstance(self.kind, str):
+            value = self.kind.lower()
+            if value == "task":
+                self.kind = EventKind.DEADLINE
+            else:
+                try:
+                    self.kind = EventKind(value)
+                except ValueError as exc:
+                    raise ValueError("kind must be event, course, deadline, or task") from exc
+        if self.starts_at is None and self.due_at is not None:
+            self.kind = EventKind.DEADLINE
+            self.starts_at = self.due_at
+        if self.ends_at is None and self.starts_at is not None:
+            # A point-in-time deadline still needs a valid interval in the DB.
+            self.ends_at = self.starts_at + timedelta(minutes=1)
+        if self.starts_at is None or self.ends_at is None:
+            raise ValueError("starts_at and ends_at (or due_at) are required")
+        if self.ends_at <= self.starts_at:
+            raise ValueError("ends_at must be after starts_at")
+        return self
+
+
+class EventSyncRequest(BaseModel):
+    source: str = Field(default="campus", min_length=1, max_length=50)
+    items: list[EventSyncItem] = Field(default_factory=list)
+
+
+class EventSyncOut(BaseModel):
     source: str
+    created: int
+    updated: int
+    total: int
+    events: list[EventOut]
 
 
 class TaskCreate(BaseModel):
@@ -152,6 +223,15 @@ class ScheduleOut(ORMModel):
     is_completed: bool
     tags: list[ScheduleTagOut] = []
     created_at: datetime
+
+
+class CalendarEntryOut(EventOut):
+    """Unified calendar representation for events and personal schedules."""
+
+    is_completed: bool | None = None
+    schedule_id: uuid.UUID | None = None
+    folder_id: uuid.UUID | None = None
+    tags: list[ScheduleTagOut] = []
 
 
 # ──────────────── Schedule Stats Schemas ────────────────

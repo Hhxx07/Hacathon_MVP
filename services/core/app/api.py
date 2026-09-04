@@ -3,12 +3,13 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from .db import get_session
 from .models import (
     CalendarEvent,
+    EventKind,
     FocusSession,
     RewardLedger,
     Schedule,
@@ -20,8 +21,12 @@ from .models import (
 )
 from .schemas import (
     BalanceOut,
+    CalendarEntryOut,
     EventCreate,
     EventOut,
+    EventSyncOut,
+    EventSyncRequest,
+    EventUpdate,
     FocusOut,
     FocusStart,
     LoginRequest,
@@ -65,20 +70,288 @@ async def login(body: LoginRequest, session: AsyncSession = Depends(get_session)
 
 
 @router.get("/events", response_model=list[EventOut])
-async def list_events(user: User = Depends(current_user), session: AsyncSession = Depends(get_session)):
-    result = await session.scalars(
-        select(CalendarEvent).where(CalendarEvent.user_id == user.id).order_by(CalendarEvent.starts_at)
-    )
+async def list_events(
+    start_date: datetime | None = Query(None, description="开始时间（含）"),
+    end_date: datetime | None = Query(None, description="结束时间（不含）"),
+    kind: str | None = Query(None, description="event/course/deadline"),
+    source: str | None = Query(None),
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """List imported calendar events owned by the current user.
+
+    Date filters use half-open intervals, which makes adjacent calendar
+    windows safe to page through without duplicating events.
+    """
+    if start_date is not None and end_date is not None and end_date <= start_date:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "end_date must be after start_date")
+    query = select(CalendarEvent).where(CalendarEvent.user_id == user.id)
+    if start_date is not None:
+        query = query.where(CalendarEvent.ends_at > start_date)
+    if end_date is not None:
+        query = query.where(CalendarEvent.starts_at < end_date)
+    if kind is not None:
+        try:
+            query = query.where(CalendarEvent.kind == EventKind(kind.lower()))
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Invalid event kind") from exc
+    if source is not None:
+        query = query.where(CalendarEvent.source == source)
+    result = await session.scalars(query.order_by(CalendarEvent.starts_at, CalendarEvent.id))
     return list(result)
 
 
+@router.post("/events/sync", response_model=EventSyncOut)
+async def sync_events(
+    body: EventSyncRequest,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    # _sync_events is defined below; lookup happens when a request is served.
+    return await _sync_events(body, user, session)
+
+
+@router.get("/events/{event_id}", response_model=EventOut)
+async def get_event(
+    event_id: uuid.UUID,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    event = await session.scalar(
+        select(CalendarEvent).where(CalendarEvent.id == event_id, CalendarEvent.user_id == user.id)
+    )
+    if event is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Event not found")
+    return event
+
+
 @router.post("/events", response_model=EventOut, status_code=status.HTTP_201_CREATED)
-async def create_event(body: EventCreate, user: User = Depends(current_user), session: AsyncSession = Depends(get_session)):
+async def create_event(
+    body: EventCreate,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+):
     event = CalendarEvent(user_id=user.id, **body.model_dump())
     session.add(event)
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, "Event with this external_id already exists") from exc
     await session.refresh(event)
     return event
+
+
+@router.put("/events/{event_id}", response_model=EventOut)
+async def update_event(
+    event_id: uuid.UUID,
+    body: EventUpdate,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    event = await session.scalar(
+        select(CalendarEvent).where(CalendarEvent.id == event_id, CalendarEvent.user_id == user.id)
+    )
+    if event is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Event not found")
+    values = body.model_dump(exclude_unset=True)
+    for field, value in values.items():
+        setattr(event, field, value)
+    starts_at = event.starts_at
+    ends_at = event.ends_at
+    if ends_at <= starts_at:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "ends_at must be after starts_at")
+    try:
+        await session.commit()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, "Event with this external_id already exists") from exc
+    await session.refresh(event)
+    return event
+
+
+@router.delete("/events/{event_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_event(
+    event_id: uuid.UUID,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    event = await session.scalar(
+        select(CalendarEvent).where(CalendarEvent.id == event_id, CalendarEvent.user_id == user.id)
+    )
+    if event is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Event not found")
+    await session.delete(event)
+    await session.commit()
+    return None
+
+
+async def _sync_events(
+    body: EventSyncRequest, user: User, session: AsyncSession
+) -> EventSyncOut:
+    """Idempotently upsert connector output using (user, source, external_id)."""
+    # A connector may accidentally emit an item twice; last occurrence wins
+    # and must not violate the calendar uniqueness constraint.
+    items = list({item.external_id: item for item in body.items}.values())
+    external_ids = [item.external_id for item in items]
+    if external_ids:
+        existing_rows = (
+            await session.scalars(
+                select(CalendarEvent).where(
+                    CalendarEvent.user_id == user.id,
+                    CalendarEvent.source == body.source,
+                    CalendarEvent.external_id.in_(external_ids),
+                )
+            )
+        ).all()
+    else:
+        existing_rows = []
+    existing = {event.external_id: event for event in existing_rows}
+    created = updated = 0
+    result: list[CalendarEvent] = []
+    for item in items:
+        event = existing.get(item.external_id)
+        values = {
+            "title": item.title,
+            "description": item.description,
+            "starts_at": item.starts_at,
+            "ends_at": item.ends_at,
+            "kind": item.kind,
+        }
+        if event is None:
+            event = CalendarEvent(
+                user_id=user.id,
+                source=body.source,
+                external_id=item.external_id,
+                **values,
+            )
+            session.add(event)
+            existing[item.external_id] = event
+            created += 1
+        else:
+            for field, value in values.items():
+                setattr(event, field, value)
+            updated += 1
+        result.append(event)
+    await session.commit()
+    for event in result:
+        await session.refresh(event)
+    return EventSyncOut(
+        source=body.source,
+        created=created,
+        updated=updated,
+        total=len(result),
+        events=[EventOut.model_validate(event) for event in result],
+    )
+
+
+async def _calendar_entries(
+    start_date: datetime | None,
+    end_date: datetime | None,
+    kind: EventKind | None,
+    source: str | None,
+    user: User,
+    session: AsyncSession,
+) -> list[CalendarEntryOut]:
+    """Read both imported calendar events and personal schedules uniformly."""
+    event_query = select(CalendarEvent).where(CalendarEvent.user_id == user.id)
+    schedule_query = select(Schedule).where(Schedule.user_id == user.id)
+    task_query = select(Task).where(Task.user_id == user.id, Task.due_at.is_not(None))
+    if start_date is not None:
+        event_query = event_query.where(CalendarEvent.ends_at > start_date)
+        schedule_query = schedule_query.where(Schedule.ends_at > start_date)
+        task_query = task_query.where(Task.due_at >= start_date)
+    if end_date is not None:
+        event_query = event_query.where(CalendarEvent.starts_at < end_date)
+        schedule_query = schedule_query.where(Schedule.starts_at < end_date)
+        task_query = task_query.where(Task.due_at < end_date)
+    if kind is not None:
+        if kind in (EventKind.COURSE, EventKind.DEADLINE, EventKind.EVENT):
+            event_query = event_query.where(CalendarEvent.kind == kind)
+            # Schedules are normal events and tasks are deadlines.
+            if kind != EventKind.EVENT:
+                schedule_query = schedule_query.where(False)
+            if kind != EventKind.DEADLINE:
+                task_query = task_query.where(False)
+    if source is not None:
+        event_query = event_query.where(CalendarEvent.source == source)
+        if source != "schedule":
+            schedule_query = schedule_query.where(False)
+            task_query = task_query.where(Task.source == source)
+        else:
+            task_query = task_query.where(False)
+    events = list(await session.scalars(event_query))
+    schedules = list(await session.scalars(schedule_query))
+    tasks = list(await session.scalars(task_query))
+    entries = [CalendarEntryOut.model_validate(event) for event in events]
+    for schedule in schedules:
+        schedule_out = await _schedule_to_out(schedule, session)
+        entries.append(
+            CalendarEntryOut(
+                id=schedule.id,
+                title=schedule.title,
+                description=schedule.description,
+                starts_at=schedule.starts_at,
+                ends_at=schedule.ends_at,
+                kind=EventKind.EVENT,
+                source="schedule",
+                external_id=str(schedule.id),
+                is_completed=schedule.is_completed,
+                schedule_id=schedule.id,
+                folder_id=schedule.folder_id,
+                tags=schedule_out.tags,
+            )
+        )
+    for task in tasks:
+        # Tasks remain their own aggregate, but a due date is rendered as a
+        # one-minute deadline in the unified calendar projection.
+        due_at = task.due_at
+        assert due_at is not None
+        entries.append(
+            CalendarEntryOut(
+                id=task.id,
+                title=task.title,
+                description=task.details,
+                starts_at=due_at,
+                ends_at=due_at + timedelta(minutes=1),
+                kind=EventKind.DEADLINE,
+                source=task.source,
+                external_id=task.external_id or str(task.id),
+                is_completed=task.status.value == "done",
+            )
+        )
+    entries.sort(key=lambda item: (item.starts_at, str(item.id)))
+    return entries
+
+
+@router.get("/calendar", response_model=list[CalendarEntryOut])
+@router.get("/calendar/events", response_model=list[CalendarEntryOut], include_in_schema=False)
+async def list_calendar(
+    start_date: datetime | None = Query(None, description="开始时间（含）"),
+    end_date: datetime | None = Query(None, description="结束时间（不含）"),
+    kind: str | None = Query(None, description="event/course/deadline"),
+    source: str | None = Query(None),
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    if start_date is not None and end_date is not None and end_date <= start_date:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "end_date must be after start_date")
+    parsed_kind = None
+    if kind is not None:
+        try:
+            parsed_kind = EventKind(kind.lower())
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Invalid event kind") from exc
+    return await _calendar_entries(start_date, end_date, parsed_kind, source, user, session)
+
+
+@router.post("/calendar/sync", response_model=EventSyncOut)
+async def sync_calendar(
+    body: EventSyncRequest,
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    return await _sync_events(body, user, session)
 
 
 @router.get("/tasks", response_model=list[TaskOut])
