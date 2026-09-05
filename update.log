@@ -1,0 +1,21 @@
+已完成日历相关部分，主要变更如下：
+- 完善 /api/v1/events
+  - 支持按时间范围、类型、来源筛选
+  - 新增单条事件查询、更新、删除
+  - 增加 source、external_id 字段
+  - 重复外部事件返回 409 Conflict
+- 新增幂等同步接口
+  - POST /api/v1/events/sync
+  - POST /api/v1/calendar/sync
+  - 按 (user_id, source, external_id) 自动创建或更新
+  - 支持校园课程、作业截止时间同步
+  - kind: "task" 会转换为 deadline
+  - 支持只提供 due_at
+- 新增统一日历查询
+  - GET /api/v1/calendar
+  - GET /api/v1/calendar/events
+  - 聚合导入事件、个人日程和带截止时间的任务
+  - 支持时间、类型、来源筛选
+  - 返回统一的日历条目结构
+- 更新了 [README.md](D:/UserDate/DeskTop/xlab桌宠/Hacathon_MVP/README.md) 中的接口说明。
+已完成 Python 编译检查和 diff 检查。当前环境未安装 pytest、fastapi 等依赖，因此无法在本机执行完整测试套件。
