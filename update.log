@@ -18,4 +18,3 @@
   - 支持时间、类型、来源筛选
   - 返回统一的日历条目结构
 - 更新了 [README.md](D:/UserDate/DeskTop/xlab桌宠/Hacathon_MVP/README.md) 中的接口说明。
-已完成 Python 编译检查和 diff 检查。当前环境未安装 pytest、fastapi 等依赖，因此无法在本机执行完整测试套件。
